@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// PrintCam 3D - Yüksek Hızlı Turbo Canlı Yayın Bulut Aktarıcısı (MJPEG Stream)
+// PrintCam 3D - Yüksek Hızlı Turbo Canlı Yayın Bulut Aktarıcısı
 // ═══════════════════════════════════════════════════════════════════════════
 
 const http = require('http');
@@ -9,6 +9,7 @@ const PORT = process.env.PORT || 3000;
 
 let latestFrame = null;
 let lastFrameTime = 0;
+let lastViewerTime = 0;
 const streamClients = new Set();
 
 let currentFlash = 0;
@@ -35,7 +36,7 @@ const server = http.createServer((req, res) => {
         latestFrame = Buffer.concat(chunks);
         lastFrameTime = Date.now();
 
-        // Yayını izleyen iPhone'lara anında tek paket halinde ilet (Gecikmesiz MJPEG)
+        // Varsa MJPEG istemcilerine fırlat
         if (streamClients.size > 0 && latestFrame.length > 100) {
           const packet = Buffer.concat([
             Buffer.from(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${latestFrame.length}\r\n\r\n`),
@@ -52,8 +53,8 @@ const server = http.createServer((req, res) => {
         }
       }
 
-      // ESP32'ye durum bildir (aktif izleyici var mı?)
-      const isClientActive = streamClients.size > 0;
+      // Aktif izleyici kontrolü (Son 4 saniye içinde sayfada biri var mıydı?)
+      const isClientActive = (streamClients.size > 0) || ((Date.now() - lastViewerTime) < 5000);
       const respData = JSON.stringify({
         active: isClientActive,
         flash: currentFlash,
@@ -64,15 +65,32 @@ const server = http.createServer((req, res) => {
       res.writeHead(200, {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(respData),
-        'Connection': 'keep-alive'
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no'
       });
       res.end(respData);
     });
     return;
   }
 
-  // 2. KESİNTİSİZ CANLI MJPEG VİDEO YAYINI (GET /stream) -> Yüksek Hızlı Akış
+  // 2. YÜKSEK HIZLI CANLI KARE ALMA (GET /capture) - Sıfır Gecikme Motoru
+  if (req.method === 'GET' && pathname === '/capture') {
+    lastViewerTime = Date.now();
+    res.writeHead(200, {
+      'Content-Type': 'image/jpeg',
+      'Cache-Control': 'no-cache, no-store, must-revalidate, max-age=0',
+      'Pragma': 'no-cache',
+      'Expires': '0',
+      'X-Accel-Buffering': 'no',
+      'Access-Control-Allow-Origin': '*'
+    });
+    res.end(latestFrame || PLACEHOLDER_FRAME);
+    return;
+  }
+
+  // 3. KESİNTİSİZ MJPEG AKIŞI (GET /stream)
   if (req.method === 'GET' && pathname === '/stream') {
+    lastViewerTime = Date.now();
     if (res.socket) res.socket.setNoDelay(true);
     res.writeHead(200, {
       'Content-Type': 'multipart/x-mixed-replace; boundary=--frame',
@@ -80,10 +98,10 @@ const server = http.createServer((req, res) => {
       'Pragma': 'no-cache',
       'Expires': '0',
       'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
       'Access-Control-Allow-Origin': '*'
     });
 
-    // İlk kareyi hemen gönder
     if (latestFrame) {
       const initialPacket = Buffer.concat([
         Buffer.from(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${latestFrame.length}\r\n\r\n`),
@@ -101,17 +119,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // 3. Tekil Anlık Kare Alma (GET /capture)
-  if (req.method === 'GET' && pathname === '/capture') {
-    res.writeHead(200, {
-      'Content-Type': 'image/jpeg',
-      'Cache-Control': 'no-cache, no-store, must-revalidate',
-      'Access-Control-Allow-Origin': '*'
-    });
-    res.end(latestFrame || PLACEHOLDER_FRAME);
-    return;
-  }
-
   // 4. Donanım Kontrol Komutları (GET /control)
   if (req.method === 'GET' && pathname === '/control') {
     const query = parsedUrl.query;
@@ -126,14 +133,14 @@ const server = http.createServer((req, res) => {
 
   // 5. Durum Sorgusu (GET /status)
   if (req.method === 'GET' && pathname === '/status') {
-    const online = (Date.now() - lastFrameTime) < 8000;
+    const online = (Date.now() - lastFrameTime) < 5000;
     res.writeHead(200, {
       'Content-Type': 'application/json',
       'Access-Control-Allow-Origin': '*'
     });
     res.end(JSON.stringify({
       online: online,
-      viewers: streamClients.size,
+      viewers: streamClients.size + (Date.now() - lastViewerTime < 5000 ? 1 : 0),
       flash: currentFlash,
       vflip: currentVflip,
       hmirror: currentHmirror
@@ -143,6 +150,7 @@ const server = http.createServer((req, res) => {
 
   // 6. iPhone 16 Pro Max PWA Mobil Uygulaması (GET /)
   if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
+    lastViewerTime = Date.now();
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(HTML_PAGE);
     return;
@@ -244,7 +252,7 @@ const HTML_PAGE = `<!DOCTYPE html>
       display: flex; align-items: center; justify-content: center; touch-action: none;
     }
     #streamImg {
-      width: 100%; height: 100%; object-fit: contain; transition: transform 0.08s ease-out;
+      width: 100%; height: 100%; object-fit: contain;
     }
     .stream-overlay {
       position: absolute; inset: 0; background: rgba(10,14,23,0.92);
@@ -257,6 +265,12 @@ const HTML_PAGE = `<!DOCTYPE html>
       border-top-color: var(--cyan); border-radius: 50%; animation: spin 0.8s linear infinite;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
+    .fps-tag {
+      position: absolute; top: 12px; left: 12px; z-index: 5;
+      background: rgba(0,0,0,0.6); backdrop-filter: blur(8px);
+      padding: 3px 8px; border-radius: 8px; font-size: 11px; font-weight: 700; color: #fff;
+      border: 1px solid rgba(255,255,255,0.1);
+    }
     .floating-bar {
       position: absolute; bottom: 12px; right: 12px; display: flex; gap: 8px; z-index: 5;
     }
@@ -325,7 +339,8 @@ const HTML_PAGE = `<!DOCTYPE html>
 
   <main>
     <div class="viewport" id="viewport">
-      <!-- Canlı Kesintisiz MJPEG Video Akışı -->
+      <div class="fps-tag" id="fpsTag">CANLI</div>
+      <!-- Sıfır Gecikmeli Sürekli Canlı Kare Oynatıcısı -->
       <img id="streamImg" src="" alt="Yayın" />
       <div class="stream-overlay" id="overlay">
         <div class="spinner"></div>
@@ -369,16 +384,16 @@ const HTML_PAGE = `<!DOCTYPE html>
         <button class="close-btn" id="closeInfo">✕</button>
       </div>
       <div class="tip-box">
-        <strong>1.</strong> Safari'nin altındaki <strong>Paylaş</strong> (yukarı ok) simgesine dokunun.<br/>
-        <strong>2.</strong> Menüden <strong>"Ana Ekrana Ekle"</strong> (Add to Home Screen) seçin.<br/>
+        <strong>1.</strong> Safari'nin altındaki <strong>Paylaş</strong> simgesine dokunun.<br/>
+        <strong>2.</strong> Menüden <strong>"Ana Ekrana Ekle"</strong> seçin.<br/>
         <strong>3.</strong> Sağ üstten <strong>"Ekle"</strong>ye dokunun.<br/><br/>
-        ✨ Artık Dynamic Island ve tam ekran ile gerçek bir iPhone uygulaması olarak kullanabilirsiniz!
+        ✨ Artık gerçek bir iPhone uygulaması olarak kullanabilirsiniz!
       </div>
       <button class="btn btn-full" id="dismissInfo">Tamam</button>
     </div>
   </div>
 
-  <footer>PrintCam 3D • Turbo Canlı Video Akışı</footer>
+  <footer>PrintCam 3D • Ultra Hızlı Canlı Akış</footer>
 
   <script>
     (function(){
@@ -387,6 +402,7 @@ const HTML_PAGE = `<!DOCTYPE html>
       const connStatus = document.getElementById('connStatus');
       const statusDot = document.getElementById('statusDot');
       const statusTxt = document.getElementById('statusTxt');
+      const fpsTag = document.getElementById('fpsTag');
       const flashRange = document.getElementById('flashRange');
       const flashBadge = document.getElementById('flashBadge');
       const flashFab = document.getElementById('flashFab');
@@ -395,33 +411,52 @@ const HTML_PAGE = `<!DOCTYPE html>
 
       let vflip = false, hmirror = false;
 
-      function startStream() {
-        // Canlı kesintisiz MJPEG video akışını doğrudan bağla
-        streamImg.src = '/stream?t=' + Date.now();
+      // ═══════════════════════════════════════════════════════════════
+      // SIFIR GECİKMELİ REAL-TIME CANLI AKIŞ MOTORU (Zero-Lag Engine)
+      // ═══════════════════════════════════════════════════════════════
+      let isRunning = true;
+      let isFetching = false;
+      let activeBlobUrl = null;
+      let frameCount = 0;
+      let lastFpsCheck = Date.now();
 
-        // Overlay'i ilk kare geldiğinde kaldır
-        setTimeout(() => {
-          overlay.classList.add('hidden');
-        }, 600);
+      async function pullFrame() {
+        if (!isRunning || isFetching) return;
+        isFetching = true;
+        const reqStart = Date.now();
 
-        streamImg.onload = () => {
-          overlay.classList.add('hidden');
-          statusDot.className = 'dot pulsing';
-          statusTxt.textContent = 'CANLI YAYIN';
-          connStatus.classList.remove('offline');
-        };
+        try {
+          const res = await fetch('/capture?_t=' + reqStart, { cache: 'no-store' });
+          if (res.ok) {
+            const blob = await res.blob();
+            if (blob.size > 200) {
+              const url = URL.createObjectURL(blob);
+              streamImg.src = url;
+              if (activeBlobUrl) URL.revokeObjectURL(activeBlobUrl);
+              activeBlobUrl = url;
 
-        streamImg.onerror = () => {
-          statusDot.className = 'dot offline';
-          statusTxt.textContent = 'BAĞLANTI BEKLENİYOR';
-          connStatus.classList.add('offline');
-          setTimeout(() => {
-            streamImg.src = '/stream?t=' + Date.now();
-          }, 1500);
-        };
+              overlay.classList.add('hidden');
+              frameCount++;
+            }
+          }
+        } catch(e) {
+        } finally {
+          isFetching = false;
+          const now = Date.now();
+          if (now - lastFpsCheck >= 1000) {
+            const fps = Math.round((frameCount * 1000) / (now - lastFpsCheck));
+            fpsTag.textContent = fps > 0 ? (fps + ' FPS') : 'CANLI';
+            frameCount = 0;
+            lastFpsCheck = now;
+          }
+          // Sonraki kareyi 25ms sonra anında çek (sıfır birikme, sıfır gecikme!)
+          setTimeout(pullFrame, 25);
+        }
       }
 
-      // Periyodik Kamera Durum Kontrolü (2 saniyede bir)
+      pullFrame();
+
+      // Periyodik Kamera Durum Kontrolü
       setInterval(async () => {
         try {
           const res = await fetch('/status?_t=' + Date.now());
@@ -436,7 +471,7 @@ const HTML_PAGE = `<!DOCTYPE html>
             connStatus.classList.add('offline');
           }
         } catch(e) {}
-      }, 2500);
+      }, 3000);
 
       function sendCmd(variable, val) {
         fetch('/control?var=' + encodeURIComponent(variable) + '&val=' + encodeURIComponent(val) + '&_t=' + Date.now()).catch(()=>{});
@@ -482,15 +517,13 @@ const HTML_PAGE = `<!DOCTYPE html>
       }
       document.getElementById('snapFab').onclick = capturePhoto;
       document.getElementById('captureBtn').onclick = capturePhoto;
-      document.getElementById('retryBtn').onclick = startStream;
+      document.getElementById('retryBtn').onclick = pullFrame;
 
       // Bilgi Modalı
       const modal = document.getElementById('infoModal');
       document.getElementById('infoBtn').onclick = () => modal.classList.add('active');
       document.getElementById('closeInfo').onclick = () => modal.classList.remove('active');
       document.getElementById('dismissInfo').onclick = () => modal.classList.remove('active');
-
-      startStream();
     })();
   </script>
 </body>
