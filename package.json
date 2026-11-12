@@ -1,0 +1,10 @@
+{
+  "name": "printcam-3d-relay",
+  "version": "1.0.0",
+  "description": "PrintCam 3D - 7/24 Kesintisiz Bulut Aktarıcı & PWA",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {}
+}
