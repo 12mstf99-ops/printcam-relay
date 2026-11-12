@@ -1,6 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// PrintCam 3D - ESP32-CAM 7/24 Kesintisiz Ücretsiz Bulut Aktarıcı (Cloud Relay)
-// Node.js Dahili HTTP Modülü Kullanır (Ekstra Kütüphane Kurulumu Gerektirmez!)
+// PrintCam 3D - Yüksek Hızlı Turbo Canlı Yayın Bulut Aktarıcısı (MJPEG Stream)
 // ═══════════════════════════════════════════════════════════════════════════
 
 const http = require('http');
@@ -8,16 +7,15 @@ const url = require('url');
 
 const PORT = process.env.PORT || 3000;
 
-// Bellek içi durum değişkenleri
 let latestFrame = null;
 let lastFrameTime = 0;
-let lastClientPing = 0;
+const streamClients = new Set();
 
 let currentFlash = 0;
 let currentVflip = 1;
 let currentHmirror = 1;
 
-// 1x1 şeffaf / siyah yer tutucu JPEG (Kamera henüz bağlanmadıysa sunulur)
+// 1x1 yer tutucu JPEG
 const PLACEHOLDER_FRAME = Buffer.from(
   '/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=',
   'base64'
@@ -29,47 +27,92 @@ const server = http.createServer((req, res) => {
 
   // 1. ESP32-CAM'den Gelen Canlı Kare Yüklemesi (POST /upload)
   if (req.method === 'POST' && pathname === '/upload') {
+    if (req.socket) req.socket.setNoDelay(true);
     const chunks = [];
     req.on('data', chunk => chunks.push(chunk));
     req.on('end', () => {
-      latestFrame = Buffer.concat(chunks);
-      lastFrameTime = Date.now();
+      if (chunks.length > 0) {
+        latestFrame = Buffer.concat(chunks);
+        lastFrameTime = Date.now();
 
-      // İstemci (iPhone) son 15 saniyede yayına baktı mı?
-      const isClientActive = (Date.now() - lastClientPing) < 15000;
+        // Yayını izleyen iPhone'lara anında tek paket halinde ilet (Gecikmesiz MJPEG)
+        if (streamClients.size > 0 && latestFrame.length > 100) {
+          const packet = Buffer.concat([
+            Buffer.from(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${latestFrame.length}\r\n\r\n`),
+            latestFrame,
+            Buffer.from('\r\n')
+          ]);
+          for (const client of streamClients) {
+            try {
+              client.write(packet);
+            } catch (e) {
+              streamClients.delete(client);
+            }
+          }
+        }
+      }
 
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
+      // ESP32'ye durum bildir (aktif izleyici var mı?)
+      const isClientActive = streamClients.size > 0;
+      const respData = JSON.stringify({
         active: isClientActive,
         flash: currentFlash,
         vflip: currentVflip,
         hmirror: currentHmirror
-      }));
+      });
+
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(respData),
+        'Connection': 'keep-alive'
+      });
+      res.end(respData);
     });
     return;
   }
 
-  // 2. iPhone 16 Pro Max İçin Anlık Kare Akışı (GET /capture)
-  if (req.method === 'GET' && pathname === '/capture') {
-    lastClientPing = Date.now(); // İstemcinin aktif olduğunu kaydet
-
+  // 2. KESİNTİSİZ CANLI MJPEG VİDEO YAYINI (GET /stream) -> Yüksek Hızlı Akış
+  if (req.method === 'GET' && pathname === '/stream') {
+    if (res.socket) res.socket.setNoDelay(true);
     res.writeHead(200, {
-      'Content-Type': 'image/jpeg',
+      'Content-Type': 'multipart/x-mixed-replace; boundary=--frame',
       'Cache-Control': 'no-cache, no-store, must-revalidate',
       'Pragma': 'no-cache',
       'Expires': '0',
+      'Connection': 'keep-alive',
       'Access-Control-Allow-Origin': '*'
     });
 
-    if (latestFrame && (Date.now() - lastFrameTime < 10000)) {
-      res.end(latestFrame);
-    } else {
-      res.end(PLACEHOLDER_FRAME);
+    // İlk kareyi hemen gönder
+    if (latestFrame) {
+      const initialPacket = Buffer.concat([
+        Buffer.from(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${latestFrame.length}\r\n\r\n`),
+        latestFrame,
+        Buffer.from('\r\n')
+      ]);
+      res.write(initialPacket);
     }
+
+    streamClients.add(res);
+
+    req.on('close', () => {
+      streamClients.delete(res);
+    });
     return;
   }
 
-  // 3. Donanım Kontrol Komutları (GET /control?var=flash&val=255)
+  // 3. Tekil Anlık Kare Alma (GET /capture)
+  if (req.method === 'GET' && pathname === '/capture') {
+    res.writeHead(200, {
+      'Content-Type': 'image/jpeg',
+      'Cache-Control': 'no-cache, no-store, must-revalidate',
+      'Access-Control-Allow-Origin': '*'
+    });
+    res.end(latestFrame || PLACEHOLDER_FRAME);
+    return;
+  }
+
+  // 4. Donanım Kontrol Komutları (GET /control)
   if (req.method === 'GET' && pathname === '/control') {
     const query = parsedUrl.query;
     if (query.var === 'flash') currentFlash = parseInt(query.val, 10) || 0;
@@ -81,31 +124,31 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // 4. Durum Sorgusu (GET /status)
+  // 5. Durum Sorgusu (GET /status)
   if (req.method === 'GET' && pathname === '/status') {
-    const online = (Date.now() - lastFrameTime) < 10000;
+    const online = (Date.now() - lastFrameTime) < 8000;
     res.writeHead(200, {
       'Content-Type': 'application/json',
       'Access-Control-Allow-Origin': '*'
     });
     res.end(JSON.stringify({
       online: online,
+      viewers: streamClients.size,
       flash: currentFlash,
       vflip: currentVflip,
-      hmirror: currentHmirror,
-      lastSeenSecondsAgo: Math.round((Date.now() - lastFrameTime) / 1000)
+      hmirror: currentHmirror
     }));
     return;
   }
 
-  // 5. iPhone 16 Pro Max PWA Mobil Uygulaması (GET /)
+  // 6. iPhone 16 Pro Max PWA Mobil Uygulaması (GET /)
   if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(HTML_PAGE);
     return;
   }
 
-  // 6. Manifest (PWA Kurulumu İçin)
+  // 7. Manifest (PWA)
   if (req.method === 'GET' && pathname === '/manifest.json') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
@@ -115,12 +158,7 @@ const server = http.createServer((req, res) => {
       start_url: "/",
       display: "standalone",
       background_color: "#0a0e17",
-      theme_color: "#0a0e17",
-      icons: [{
-        src: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%2300e5ff'/%3E%3Cpath d='M20 40h60v35H20z' fill='%230a0e17'/%3E%3Ccircle cx='50' cy='55' r='12' fill='%23ff7043'/%3E%3C/svg%3E",
-        sizes: "192x192",
-        type: "image/svg+xml"
-      }]
+      theme_color: "#0a0e17"
     }));
     return;
   }
@@ -130,10 +168,10 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`PrintCam 3D Bulut Aktarıcı Port ${PORT} üzerinde hazır!`);
+  console.log(`PrintCam 3D Turbo Stream Port ${PORT} üzerinde hazır!`);
 });
 
-// Gömülü iPhone 16 Pro Max PWA Arayüzü
+// iPhone 16 Pro Max Uyumlu Canlı Yayın Arayüzü
 const HTML_PAGE = `<!DOCTYPE html>
 <html lang="tr">
 <head>
@@ -211,9 +249,9 @@ const HTML_PAGE = `<!DOCTYPE html>
     .stream-overlay {
       position: absolute; inset: 0; background: rgba(10,14,23,0.92);
       display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px;
-      z-index: 10;
+      z-index: 10; transition: opacity 0.3s ease;
     }
-    .stream-overlay.hidden { display: none; }
+    .stream-overlay.hidden { opacity: 0; pointer-events: none; }
     .spinner {
       width: 32px; height: 32px; border: 3px solid rgba(0,229,255,0.2);
       border-top-color: var(--cyan); border-radius: 50%; animation: spin 0.8s linear infinite;
@@ -279,7 +317,7 @@ const HTML_PAGE = `<!DOCTYPE html>
   <header>
     <div class="status-badge" id="connStatus">
       <div class="dot pulsing" id="statusDot"></div>
-      <span id="statusTxt">BULUT CANLI</span>
+      <span id="statusTxt">CANLI YAYIN</span>
     </div>
     <div class="title">🖨️ PrintCam 3D</div>
     <button class="icon-btn" id="infoBtn">ℹ️</button>
@@ -287,10 +325,11 @@ const HTML_PAGE = `<!DOCTYPE html>
 
   <main>
     <div class="viewport" id="viewport">
+      <!-- Canlı Kesintisiz MJPEG Video Akışı -->
       <img id="streamImg" src="" alt="Yayın" />
       <div class="stream-overlay" id="overlay">
         <div class="spinner"></div>
-        <p id="overlayMsg">Kamera Akışı Bekleniyor...</p>
+        <p id="overlayMsg">Kamera Akışı Başlatılıyor...</p>
         <button class="btn" id="retryBtn" style="margin-top:8px;">Yeniden Bağlan</button>
       </div>
       <div class="floating-bar">
@@ -339,7 +378,7 @@ const HTML_PAGE = `<!DOCTYPE html>
     </div>
   </div>
 
-  <footer>PrintCam 3D • 7/24 Kesintisiz Bulut Aktarıcı</footer>
+  <footer>PrintCam 3D • Turbo Canlı Video Akışı</footer>
 
   <script>
     (function(){
@@ -355,34 +394,49 @@ const HTML_PAGE = `<!DOCTYPE html>
       const hmirrorBtn = document.getElementById('hmirrorBtn');
 
       let vflip = false, hmirror = false;
-      let snapRunning = true;
 
       function startStream() {
-        overlay.classList.add('hidden');
-        statusDot.className = 'dot pulsing';
-        statusTxt.textContent = 'BULUT CANLI';
-        connStatus.classList.remove('offline');
+        // Canlı kesintisiz MJPEG video akışını doğrudan bağla
+        streamImg.src = '/stream?t=' + Date.now();
 
-        function pollNext() {
-          if (!snapRunning) return;
-          const frame = new Image();
-          frame.onload = () => {
-            if (!snapRunning) return;
-            streamImg.src = frame.src;
-            overlay.classList.add('hidden');
-            statusDot.className = 'dot pulsing';
-            statusTxt.textContent = 'BULUT CANLI';
-            connStatus.classList.remove('offline');
-            setTimeout(pollNext, 120); // ~8 FPS akıcı canlı yayın
-          };
-          frame.onerror = () => {
-            if (!snapRunning) return;
-            setTimeout(pollNext, 800);
-          };
-          frame.src = '/capture?_t=' + Date.now();
-        }
-        pollNext();
+        // Overlay'i ilk kare geldiğinde kaldır
+        setTimeout(() => {
+          overlay.classList.add('hidden');
+        }, 600);
+
+        streamImg.onload = () => {
+          overlay.classList.add('hidden');
+          statusDot.className = 'dot pulsing';
+          statusTxt.textContent = 'CANLI YAYIN';
+          connStatus.classList.remove('offline');
+        };
+
+        streamImg.onerror = () => {
+          statusDot.className = 'dot offline';
+          statusTxt.textContent = 'BAĞLANTI BEKLENİYOR';
+          connStatus.classList.add('offline');
+          setTimeout(() => {
+            streamImg.src = '/stream?t=' + Date.now();
+          }, 1500);
+        };
       }
+
+      // Periyodik Kamera Durum Kontrolü (2 saniyede bir)
+      setInterval(async () => {
+        try {
+          const res = await fetch('/status?_t=' + Date.now());
+          const data = await res.json();
+          if (data.online) {
+            statusDot.className = 'dot pulsing';
+            statusTxt.textContent = 'CANLI YAYIN';
+            connStatus.classList.remove('offline');
+          } else {
+            statusDot.className = 'dot offline';
+            statusTxt.textContent = 'KAMERA ÇEVRİMDIŞI';
+            connStatus.classList.add('offline');
+          }
+        } catch(e) {}
+      }, 2500);
 
       function sendCmd(variable, val) {
         fetch('/control?var=' + encodeURIComponent(variable) + '&val=' + encodeURIComponent(val) + '&_t=' + Date.now()).catch(()=>{});
@@ -422,7 +476,7 @@ const HTML_PAGE = `<!DOCTYPE html>
         const u = '/capture?_t=' + Date.now();
         const a = document.createElement('a');
         a.href = u;
-        a.download = 'katman_foto_' + Date.now() + '.jpg';
+        a.download = '3d_baski_' + Date.now() + '.jpg';
         a.target = '_blank';
         a.click();
       }
